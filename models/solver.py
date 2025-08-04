@@ -1,8 +1,12 @@
-from typing import Type, Any, Generator
+from typing import Type, Any, Generator, Literal
 from abc import ABC, abstractmethod
 import torch
 from torch import nn
 from .mlp import MLPOutput, MLPBase, MLP
+
+T_RETURN_MODE = Literal[
+    'mlp_output', 'tuple', 'global', 'local',
+]
 
 
 class Solver(nn.Module, ABC):
@@ -44,6 +48,16 @@ class Solver(nn.Module, ABC):
             up_index=up_index,
         )
         
+        self._ret_mode: T_RETURN_MODE = 'mlp_output'
+    
+    def return_mode_(self, mode: T_RETURN_MODE) -> T_RETURN_MODE:
+        self._ret_mode = mode
+        return self._ret_mode
+    
+    @property
+    def return_mode(self) -> T_RETURN_MODE:
+        return self._ret_mode
+        
     @property
     def ground_pos(self) -> float:
         return self._ground_pos
@@ -73,8 +87,36 @@ class Solver(nn.Module, ABC):
         yield from self.model.parameters()
 
     def forward(self, x: torch.Tensor) -> MLPOutput:
-        return self.model.forward(x)
+        ret = self.model.forward(x)
+        if self._ret_mode == 'mlp_output':
+            return ret
+        elif self._ret_mode == 'tuple':
+            return ret.local_branch, ret.global_branch
+        elif self._ret_mode == 'local':
+            return ret.local_branch
+        elif self._ret_mode == 'global':
+            return ret.global_branch
+        else:
+            raise NotImplementedError
 
     @abstractmethod
     def compute_loss(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         pass
+    
+    def mode_scope(self, mode: T_RETURN_MODE):
+        return SolverReturnMode(
+            solver=self, mode=mode,
+        )
+
+class SolverReturnMode:
+    def __init__(self, solver: Solver, mode: T_RETURN_MODE):
+        self.solver = solver
+        self.mode_original = self.solver.return_mode
+        self.mode_scoped = mode
+    
+    def __enter__(self):
+        self.solver.return_mode_(self.mode_scoped)
+        return self
+    
+    def __exit__(self, *args, **kwargs):
+        self.solver.return_mode_(self.mode_original)
