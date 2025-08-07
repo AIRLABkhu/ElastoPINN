@@ -9,8 +9,9 @@ from torch.utils.data import DataLoader
 from configs.config import CFG as cfg
 from data.pac_nerf import PACNeRFDataset
 
-from models.mlp import mlp_dict
-from models.navier_cauchy import NavierCauchy
+from models.mlp import mlp_dict, LoRAMLP
+from models.navier_cauchy_neo_hookean import NavierCauchy
+from utils.nn import SIREN
 from utils.logging import (
     Averager,
     CheckpointWriter,
@@ -30,11 +31,16 @@ add('--num-frames', '-nf', type=int, default=14)
 add('--batch-size', '-bs', type=int, default=20000)
 add('--learning-rate', '-lr', type=float, default=1.0E-4)
 add('--property-learning-rate', '-plr', type=float, default=1.0E-1)
+add('--loss-pde', type=float, default=None)
+add('--loss-gt', type=float, default=None)
+add('--loss-ic', type=float, default=None)
+add('--loss-bc', type=float, default=None)
 add('--epochs', '-e', type=int, default=10_000)
 add('--warmup', '-w', type=int, default=5_000)
 add('--save-every', type=int, default=1_000)
 add('--tag', type=str, default=None)
 add('--overwrite', action='store_true', default=False)
+add('--const-lr', action='store_true', default=False)
 args = parser.parse_args()
 
 # -------------------------------------
@@ -77,7 +83,7 @@ solver = NavierCauchy(
     hid_dim=128,
     depth=8,
     model_type=mlp_dict[args.mlp],
-    activation = nn.ELU,
+    activation=SIREN,
     
     # Environment
     ground_pos = 0,                    # The y-coord of the ground
@@ -91,8 +97,8 @@ solver = NavierCauchy(
     
     # Physical parameter optimization options
     optimize_density    = False,        # Indicates whether optimize ρ
-    optimize_youngs     = True,         # Indicates whether optimize E
-    optimize_poissons   = False,        # Indicates whether optimize ν
+    optimize_youngs     = False,        # Indicates whether optimize E
+    optimize_poissons   = True,         # Indicates whether optimize ν
 ).to(DEVICE)
 
 # -------------------------------------
@@ -107,7 +113,7 @@ optimizers = [
         solver.network_parameters(),
         lr=args.learning_rate,
     ), 
-    optim.Adam(
+    optim.AdamW(
         solver.property_parameters(),
         lr=args.property_learning_rate,
     ), 
@@ -161,16 +167,25 @@ ckpt_writer.copy_code(
 # -------------------------------------
 
 # The loss weights
-loss_weight_pde: float = cfg.ELASTOMER.LOSS.PDE
-loss_weight_gt: float = cfg.ELASTOMER.LOSS.GT
-loss_weight_vel: float = cfg.ELASTOMER.LOSS.VEL
-loss_weight_bc: float = cfg.ELASTOMER.LOSS.BC
-loss_weight_ic: float = cfg.ELASTOMER.LOSS.IC
+select_lw = lambda arg_, cfg_: cfg_ if arg_ is None else arg_
+loss_weight_pde: float = select_lw(args.loss_pde, cfg.ELASTOMER.LOSS.PDE)
+loss_weight_gt: float = select_lw(args.loss_gt, cfg.ELASTOMER.LOSS.GT)
+loss_weight_ic: float = select_lw(args.loss_ic, cfg.ELASTOMER.LOSS.IC)
+loss_weight_bc: float = select_lw(args.loss_bc, cfg.ELASTOMER.LOSS.BC)
 
 # The training loop
 for epoch in range(n_epochs):
     
     for sample in tqdm(loader, desc=f"Epoch {epoch+1}/{n_epochs}"):
+        
+        b_warmup_done = epoch >= n_warmups
+        
+        # switch to lora mode
+        if isinstance(solver.model, LoRAMLP):
+            if b_warmup_done:
+                solver.model.lora()
+            else:
+                solver.model.linear()
         
         # input preparation
         geometry: torch.Tensor = sample['geometry']
@@ -213,7 +228,6 @@ for epoch in range(n_epochs):
         losses: dict[str, torch.Tensor] = {
             'pde_loss': losses['pde_loss'] * loss_weight_pde,
             'gt_loss': losses['gt_loss'] * loss_weight_gt,
-            'vel_loss': losses['vel_loss'] * loss_weight_vel,
             'bc_loss': losses['bc_loss'] * loss_weight_bc,
             'ic_loss': losses['ic_loss'] * loss_weight_ic,
         }
@@ -222,7 +236,7 @@ for epoch in range(n_epochs):
         total_loss = sum(losses.values())
         total_loss.backward()
 
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clipping 
+        torch.nn.utils.clip_grad_norm_(solver.parameters(), 1.0) # clipping 
         optimizers[0].step()
         optimizers[0].zero_grad()
         if b_warmup_done:
@@ -236,10 +250,11 @@ for epoch in range(n_epochs):
     epoch_loss_detailed = loss_history_detailed.flush()
     epoch_loss = sum(epoch_loss_detailed.values())
 
-    # scheduler step w.r.t. the total loss
-    schedulers[0].step()
-    if b_warmup_done:
-        schedulers[1].step()
+    # scheduler step (w.r.t. the total loss if need)
+    if not args.const_lr:
+        schedulers[0].step()
+        if b_warmup_done:
+            schedulers[1].step()
 
     # logging the physical parameters and total loss
     loss_history.push({
