@@ -4,7 +4,7 @@ conda create -n $ENV_NAME python=3.9 -y
 conda activate $ENV_NAME 
 
 pip install ipykernel ipywidgets tqdm
-conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 pytorch-cuda=12.4 -c pytorch -c nvidia -y
+conda install pytorch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 cpuonly -c pytorch -y
 
 conda install -c iopath iopath -y
 conda install jupyter -y
@@ -17,3 +17,7 @@ git clone https://github.com/facebookresearch/pytorch3d.git
 cd pytorch3d
 pip install -e .
 cd ..
+
+pip install torch_geometric
+pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.4.0+cpu.html
+

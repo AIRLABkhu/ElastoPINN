@@ -1,5 +1,5 @@
 import os
-from typing import Iterator
+from typing import Iterator, Optional
 from glob import glob
 import json
 import torch
@@ -33,6 +33,7 @@ class PACNeRFDataset(Dataset):
         dataroot: str,
         instance: str,
         verbose: bool=False,
+        max_frames: Optional[int] = None,
     ):
         self._dataroot = dataroot
         self._instance = instance
@@ -48,7 +49,12 @@ class PACNeRFDataset(Dataset):
         dname_ply = os.path.join(dataroot, 'simulation_data', instance)
         num_views = len(glob(os.path.join(dname_png, 'r_*_-1.png')))
         num_frames = len(glob(os.path.join(dname_png, 'r_0_*.png'))) - 1
-        
+
+        # 내가 임의으로 frame 설정할 수 있게. 
+        if max_frames is not None:
+            num_frames = min(num_frames, max_frames)
+        print(f'selected num_frames: {num_frames}')
+
         if verbose:
             print('PACNeRFDataset:', 'collecting images and point clouds.')
         self.images = [[None for _ in range(num_frames)] for _ in range(num_views)]
@@ -84,6 +90,11 @@ class PACNeRFDataset(Dataset):
         for sample in metadata:
             parts = os.path.splitext(sample['file_path'])[0].split('_')
             view, frame = int(parts[1]), int(parts[2])
+            
+            # max frame 보다 크면 집어 넣지 마라 
+            
+            if (frame < 0) or (frame >= num_frames):
+                continue
             self.metadata['time'][view, frame] = sample['time'] * 2.0  # map to [0, 1]
             self.metadata['c2w'][view, frame] = torch.tensor(sample['c2w'])
             self.metadata['intrinsic'][view, frame] = torch.tensor(sample['intrinsic'])
@@ -119,7 +130,7 @@ class PACNeRFDataset(Dataset):
     
     @property
     def ground_pos(self) -> float:
-        return self.pointclouds[:, self.up_index].quantile(0.05).item()
+        return self.pointclouds[..., self.up_index].quantile(0.05).item()
         # return self.pointclouds[:, self.up_index].min().item()
         # return 0
     
@@ -133,7 +144,7 @@ class PACNeRFDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         return {
             'projection': self.images[:, index],
-            'geometry': self.pointclouds[index],
+            'geometry': self.pointclouds[0],
             'displacement': self.pointclouds[index] - self.pointclouds[0],
             'time': self.metadata['time'][:, index],
             'c2w': self.metadata['c2w'][:, index],
