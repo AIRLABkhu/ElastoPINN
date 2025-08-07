@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from typing import Generator, Optional, Literal, Callable
 import torch
 from torch import nn
+from utils.nn import SIREN
 
 
 class MLPOutput:
@@ -91,8 +92,14 @@ class MLPBase(nn.Module, ABC):
         if hid_dim is None:
             hid_dim = self.hid_dim
         return nn.Linear(hid_dim, self.out_dim)
+
+    def initialize_siren(self):
+        for module in self.modules():
+            if isinstance(module, SIREN):
+                module.is_first = True
+                break
     
-    def _initialize_weights(self):
+    def initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_normal_(m.weight)
@@ -131,7 +138,8 @@ class MLP(MLPBase):
             *self._make_hidden_blocks(self.depth),
             self._make_linear_head(),
         )
-        self._initialize_weights()
+        self.initialize_weights()
+        self.initialize_siren()
     
     @mlp_forward
     def forward(self, x: torch.Tensor) -> MLPOutput:
@@ -153,7 +161,8 @@ class GlobalMLP(MLPBase):
         self.layer_hidden_2 = nn.Sequential(*self._make_hidden_blocks(1))
         self.layer_output = self._make_linear_head()
         
-        self._initialize_weights()
+        self.initialize_weights()
+        self.initialize_siren()
     
     @mlp_forward
     def forward(self, x: torch.Tensor) -> torch.Tensor:

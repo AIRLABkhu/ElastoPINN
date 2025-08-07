@@ -53,7 +53,8 @@ class AttnMLP(MLPBase):
         self.layer_hidden_1 = nn.Sequential(*self._make_hidden_blocks(depth_1))
         self.layer_output = self._make_linear_head()
         
-        self._initialize_weights() 
+        self.initialize_weights() 
+        self.initialize_siren()
     
     @mlp_forward
     def forward(self, x: torch.Tensor) -> torch.Tensor:

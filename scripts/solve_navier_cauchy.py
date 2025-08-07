@@ -31,6 +31,7 @@ add('--batch-size', '-bs', type=int, default=20000)
 add('--learning-rate', '-lr', type=float, default=1.0E-4)
 add('--property-learning-rate', '-plr', type=float, default=1.0E-1)
 add('--epochs', '-e', type=int, default=10_000)
+add('--warmup', '-w', type=int, default=5_000)
 add('--save-every', type=int, default=1_000)
 add('--tag', type=str, default=None)
 add('--overwrite', action='store_true', default=False)
@@ -76,7 +77,7 @@ solver = NavierCauchy(
     hid_dim=128,
     depth=8,
     model_type=mlp_dict[args.mlp],
-    activation = nn.Tanh,
+    activation = nn.ELU,
     
     # Environment
     ground_pos = 0,                    # The y-coord of the ground
@@ -99,6 +100,7 @@ solver = NavierCauchy(
 # -------------------------------------
 
 n_epochs = args.epochs
+n_warmups = args.warmup
 
 optimizers = [
     optim.AdamW(
@@ -113,10 +115,15 @@ optimizers = [
 
 schedulers = [
     torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
+        optimizers[0],
         T_max=n_epochs,
         eta_min=0,
-    ) for optimizer in optimizers
+    ), 
+    torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizers[1],
+        T_max=n_epochs - n_warmups,
+        eta_min=0,
+    ), 
 ]
 
 # -------------------------------------
@@ -191,13 +198,16 @@ for epoch in range(n_epochs):
             raise NotImplementedError(solver.model.input_shape)
 
         # forward
+        b_warmup_done = epoch >= n_warmups
         losses = solver.compute_loss(
             xyzt,
             time_dim=num_timesteps,
             point_dim=num_points,
             time=time_value,
             displacement=displacement,
-            use_pde=True,
+            use_pde=b_warmup_done,
+            use_ic=False,
+            use_bc=False,
             use_vel=False,
         )
         losses: dict[str, torch.Tensor] = {
@@ -207,15 +217,17 @@ for epoch in range(n_epochs):
             'bc_loss': losses['bc_loss'] * loss_weight_bc,
             'ic_loss': losses['ic_loss'] * loss_weight_ic,
         }
-
+        
         # loss backward and gradient steps
         total_loss = sum(losses.values())
         total_loss.backward()
 
         # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clipping 
-        for optimizer in optimizers:
-            optimizer.step()
-            optimizer.zero_grad()
+        optimizers[0].step()
+        optimizers[0].zero_grad()
+        if b_warmup_done:
+            optimizers[1].step()
+            optimizers[1].zero_grad()
 
         # logging the losses
         loss_history_detailed.push(losses)
@@ -225,8 +237,9 @@ for epoch in range(n_epochs):
     epoch_loss = sum(epoch_loss_detailed.values())
 
     # scheduler step w.r.t. the total loss
-    for scheduler in schedulers:
-        scheduler.step()
+    schedulers[0].step()
+    if b_warmup_done:
+        schedulers[1].step()
 
     # logging the physical parameters and total loss
     loss_history.push({
@@ -239,11 +252,12 @@ for epoch in range(n_epochs):
     }, flush=True)
     lr_history.push({
         'network': optimizers[0].param_groups[0]['lr'],
-        'prop': optimizers[1].param_groups[0]['lr'],
+        'prop': optimizers[1].param_groups[0]['lr'] if b_warmup_done else 0.0,
     }, flush=True)
     
     # save the checkpoints to the file(s)
     ckpt_writer.write({
+        'args': vars(args),
         'epoch': epoch + 1,
         'model': {
             key: val.clone().detach().cpu()

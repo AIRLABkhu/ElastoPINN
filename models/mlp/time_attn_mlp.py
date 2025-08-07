@@ -53,7 +53,8 @@ class TimeAttnMLP(MLPBase):
         self.layer_hidden_1 = nn.Sequential(*self._make_hidden_blocks(depth_1))
         self.layer_output = self._make_linear_head()
         
-        self._initialize_weights() 
+        self.initialize_weights() 
+        self.initialize_siren()
         
     @property
     def input_shape(self) -> Literal['flat', 'spatio-temporal']:
