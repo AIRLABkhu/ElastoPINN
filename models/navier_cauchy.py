@@ -14,7 +14,7 @@ class NavierCauchy(Solver):
         activation: Type[nn.Module] = nn.Tanh,
         model_type: Type[MLPBase] = MLP,
         # configuring the environment
-        ground_pos: float = 0.0,
+        ground_pos: float = 1.0E-6,
         gravity: float = 9.8,
         up_index: int = 1,
         # configuring the physical properties
@@ -50,6 +50,10 @@ class NavierCauchy(Solver):
             requires_grad=optimize_youngs, 
         )
         self.register_physical_property('poissons', poissons, optimize_poissons)
+        # self.logit_poissons = nn.Parameter(
+        #     torch.logit(torch.tensor(poissons * 2.0)), 
+        #     requires_grad=optimize_poissons, 
+        # )
         self.log_poissons = nn.Parameter(
             torch.log(torch.tensor(poissons)), 
             requires_grad=optimize_poissons, 
@@ -66,13 +70,13 @@ class NavierCauchy(Solver):
 
     @property
     def poissons(self): 
-        return torch.exp(self.log_poissons)
+        return torch.sigmoid(self.log_poissons) 
 
     def property_parameters(self):
         yield self.log_density
         yield self.log_youngs
-        yield self.log_poissons
-    
+        yield self.logit_poissons
+
     def compute_loss(
         self,
         xyzt: torch.Tensor,
@@ -140,85 +144,120 @@ class NavierCauchy(Solver):
             lmbda = (self.youngs * self.poissons) / ((1 + self.poissons) * (1 - 2 * self.poissons))
             mu = self.youngs / (2 * (1 + self.poissons))
 
-            # The stress divergence term in Navier-Cauchy equation requires the second-order spatial derivatives.
-            div_u = du_dx + dv_dy + dw_dz
+            # Deformation gradient and Neo-Hookean stress tensor
+            grad_u_mat = torch.stack([
+                torch.stack([du_dx, du_dy, du_dz], dim=-1),
+                torch.stack([dv_dx, dv_dy, dv_dz], dim=-1),
+                torch.stack([dw_dx, dw_dy, dw_dz], dim=-1),
+            ], dim=-2)
+            I = torch.eye(3, **kwargs).unsqueeze(0)
+            F = I + grad_u_mat
+            J = torch.det(F)
+
+            j_threshold = 1e-4 
+            reg_loss = torch.mean(torch.relu(j_threshold - J)**2)
+
+            F_stable = F + torch.eye(3, **kwargs) * 1e-9
+            try:
+                F_inv_T = torch.inverse(F_stable).transpose(-1, -2)
+            except torch.linalg.LinAlgError:
+                # 만약 역행렬 계산이 실패하면 (매우 드묾), 학습을 중단시키지 않고
+                # 단위 행렬을 사용하여 해당 스텝의 그래디언트를 약화시킵니다.
+                F_inv_T = torch.eye(3, **kwargs).unsqueeze(0)
+
+            j_threshold = 1e-4  # 예: 0.0001 (부피가 99.99% 이상 줄어들지 않도록 함)
+            log_J = torch.log(torch.clamp(J, min=j_threshold))
+
+            # origin 
+            # sigma = mu * (B - I) * inv_J + lmbda * log_J * inv_J * I 
+
+            # 1st piola kirchhoff stress tensor
+            # P = μF + (λlogJ - μ)F⁻ᵀ
+            P = mu * F + (lmbda * log_J[..., None, None] - mu) * F_inv_T
+
+            # Divergence of stress
+            sigma_xx, sigma_xy, sigma_xz = P[..., 0, 0], P[..., 0, 1], P[..., 0, 2]
+            sigma_yx, sigma_yy, sigma_yz = P[..., 1, 0], P[..., 1, 1], P[..., 1, 2]
+            sigma_zx, sigma_zy, sigma_zz = P[..., 2, 0], P[..., 2, 1], P[..., 2, 2]
+
+            div_sigma_x = (
+                autograd.grad(sigma_xx, xyzt, torch.ones_like(sigma_xx), create_graph=True)[0][..., 0] + 
+                autograd.grad(sigma_xy, xyzt, torch.ones_like(sigma_xy), create_graph=True)[0][..., 1] + 
+                autograd.grad(sigma_xz, xyzt, torch.ones_like(sigma_xz), create_graph=True)[0][..., 2]
+            )
+            div_sigma_y = (
+                autograd.grad(sigma_yx, xyzt, torch.ones_like(sigma_yx), create_graph=True)[0][..., 0] + 
+                autograd.grad(sigma_yy, xyzt, torch.ones_like(sigma_yy), create_graph=True)[0][..., 1] + 
+                autograd.grad(sigma_yz, xyzt, torch.ones_like(sigma_yz), create_graph=True)[0][..., 2]
+            )
+            div_sigma_z = (
+                autograd.grad(sigma_zx, xyzt, torch.ones_like(sigma_zx), create_graph=True)[0][..., 0] + 
+                autograd.grad(sigma_zy, xyzt, torch.ones_like(sigma_zy), create_graph=True)[0][..., 1] + 
+                autograd.grad(sigma_zz, xyzt, torch.ones_like(sigma_zz), create_graph=True)[0][..., 2]
+            )
+
+            # Residual of the momentum equation
+            pde_x = self.density * du_dt2 - div_sigma_x
+            pde_y = self.density * dv_dt2 - div_sigma_y + self.density * self.gravity
+            pde_z = self.density * dw_dt2 - div_sigma_z
             
-            grad_div_u = autograd.grad(div_u, xyzt, torch.ones_like(div_u), create_graph=True)[0]
-            d_div_u_dx = grad_div_u[..., 0]
-            d_div_u_dy = grad_div_u[..., 1]
-            d_div_u_dz = grad_div_u[..., 2]
-
-            lap_u = autograd.grad(du_dx, xyzt, torch.ones_like(du_dx), create_graph=True)[0][...,  0] + \
-                    autograd.grad(du_dy, xyzt, torch.ones_like(du_dy), create_graph=True)[0][..., 1] + \
-                    autograd.grad(du_dz, xyzt, torch.ones_like(du_dz), create_graph=True)[0][..., 2]
-
-            lap_v = autograd.grad(dv_dx, xyzt, torch.ones_like(dv_dx), create_graph=True)[0][..., 0] + \
-                    autograd.grad(dv_dy, xyzt, torch.ones_like(dv_dy), create_graph=True)[0][..., 1] + \
-                    autograd.grad(dv_dz, xyzt, torch.ones_like(dv_dz), create_graph=True)[0][..., 2]
-
-            lap_w = autograd.grad(dw_dx, xyzt, torch.ones_like(dw_dx), create_graph=True)[0][..., 0] + \
-                    autograd.grad(dw_dy, xyzt, torch.ones_like(dw_dy), create_graph=True)[0][..., 1] + \
-                    autograd.grad(dw_dz, xyzt, torch.ones_like(dw_dz), create_graph=True)[0][..., 2]
-
-            # The Navier-Cauchy equation residuals
-            pde_x = self.density * du_dt2 - ( (lmbda + mu) * d_div_u_dx + mu * lap_u )
-            pde_y = self.density * dv_dt2 - ( (lmbda + mu) * d_div_u_dy + mu * lap_v )
-            pde_z = self.density * dw_dt2 - ( (lmbda + mu) * d_div_u_dz + mu * lap_w )
-
-            # The gravity term.
-            pde_y -= self.density * self.gravity
-            
-            if f_ext is not None:
-                pde_x -= f_ext[:, 0]
-                pde_y -= f_ext[:, 1]
-                pde_z -= f_ext[:, 2]
-
-            pde_loss = torch.mean(pde_x**2 + pde_y**2 + pde_z**2)
+            ## 
+            # incompressilibility_weight = 1E+4
+            # incompressilibility_loss = torch.mean(J-1) * incompressilibility_weight
+            # cp_loss = incompressilibility_loss
+            pde_loss = torch.mean(pde_x**2 + pde_y**2 + pde_z**2)  + reg_loss
 
         # 4. Initial Condition (IC) Loss
-        ic_mask = xyzt[..., 3] == 0.0
-        if use_ic and (ic_mask.sum() > 0):
-            if xyzt.ndim == 2:
-                ic_u = self.forward(xyzt[ic_mask]).local_branch.reshape(-1, 3)
-            elif xyzt.ndim == 3:
-                ic_u = uvw_local.reshape(time_dim, point_dim, -1)[ic_mask]
-            u0 = torch.zeros_like(ic_u)
-            ic_loss = torch.nn.functional.mse_loss(ic_u, u0)
-        else:
-            ic_loss = torch.tensor(0.0, **kwargs)
+        ic_loss = torch.tensor(0.0, **kwargs)
+        if use_ic :
+            ic_mask = xyzt[..., 3] == 0.0
+            if torch.any(ic_mask):
+                # 1. 초기 변위 손실 (Initial Displacement Loss)
+                u_ic = u[ic_mask]
+                v_ic = v[ic_mask]
+                w_ic = w[ic_mask]
+                
+                # 2. 초기 속도 손실 (Initial Displacement Loss)
+                loss_ic_disp = torch.mean(u_ic**2 + v_ic**2 + w_ic**2)
+                du_dt_ic = du_dt[ic_mask]
+                dv_dt_ic = dv_dt[ic_mask]
+                dw_dt_ic = dw_dt[ic_mask]
+
+                # L_ic_velocity = (du/dt(t=0)-0)^2 + (dv/dt(t=0)-0)^2 + (dw/dt(t=0)-0)^2
+                loss_ic_vel = torch.mean(du_dt_ic**2 + dv_dt_ic**2 + dw_dt_ic**2)
+    
+                ic_loss = loss_ic_disp + loss_ic_vel
 
         # 5. Boundary Condition (BC) Loss
         bc_loss = torch.tensor(0.0, **kwargs)
         if use_bc:
-            # 5.1. y-coordinate of the current position
-            # Initial y + y-direction displacement
-            y_initial = xyzt[..., self.up_index].reshape(-1, 1)
-            y_current = y_initial + v
-
-            # 5.2. Penetration Loss
-            penetration = torch.relu(self.ground_pos - y_current)
-            loss_penetration = torch.mean(penetration**2) 
-
-            # 5.3. Calculate the orthogonal stress in the y-direction.
-            lmbda = (self.youngs * self.poissons) / ((1 + self.poissons) * (1 - 2 * self.poissons))
-            mu = self.youngs / (2 * (1 + self.poissons))
-            div_u = du_dx + dv_dy + dw_dz  # strain: How much the surrounding space has moved due to the displacement.
-            epsilon_yy = dv_dy
-            sigma_y = lmbda * div_u + 2 * mu * epsilon_yy
-
-            # 5.4. Complementarity and stress conditions:
-            # C1: When `y_current ≈ ground_pos`, the stress must be compression.
-            contact_mask = (y_current <= self.ground_pos).float() 
-            loss_tensile_stress = torch.mean((contact_mask * torch.relu(sigma_y))**2) # 거의 발동 안됨
-
-            # C2: When `y_current > ground_pos`, the stress must be zero.
-            no_contact_mask = (y_current > self.ground_pos).float()
-            loss_no_contact_stress = torch.mean((no_contact_mask * sigma_y)**2)
+            final_xyz = xyzt[..., :3] + uvw_local
+            final_y = final_xyz[..., self.up_index]
             
-            # The final BC loss is the sum of the terms.
-            bc_loss = loss_penetration # + loss_no_contact_stress
+            # penetration_mask = final_y < self.ground_pos
             
-        # 6. Velocity-Driven GT Loss
+            # penetration_loss = torch.tensor(0.0, **kwargs)
+            # if torch.any(penetration_mask):
+            #     # 관통한 깊이(ground_pos - final_y)의 제곱에 비례하는 손실 계산
+            #     penetration_error = self.ground_pos - final_y[penetration_mask]
+            #     penetration_loss = torch.mean(penetration_error**2)
+
+            # 속도 제약-(Sticky Loss) PAC-NERF 에서 구현된거 그대로 사용 
+            contact_epsilon = 1.0E-6 
+            contact_mask = final_y < (self.ground_pos + contact_epsilon)
+            
+            sticky_loss = torch.tensor(0.0, **kwargs)
+            if torch.any(contact_mask):
+
+                velocity = torch.stack([du_dt, dv_dt, dw_dt], dim=-1)
+                velocity_at_contact = velocity[contact_mask]
+                
+                # 속도의 제곱(squared norm)을 손실로 하여 0으로 수렴하도록 유도
+                sticky_loss = torch.mean(torch.sum(velocity_at_contact**2, dim=-1))
+
+            bc_loss = sticky_loss
+
+
         if use_vel and (displacement is not None) and (time is not None):
             uvw_unflat = uvw_global.reshape(time_dim, point_dim, -1)
             disp_unflat = displacement.reshape(time_dim, point_dim, -1)
