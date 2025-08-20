@@ -50,12 +50,8 @@ class NavierCauchy(Solver):
             requires_grad=optimize_youngs, 
         )
         self.register_physical_property('poissons', poissons, optimize_poissons)
-        # self.logit_poissons = nn.Parameter(
-        #     torch.logit(torch.tensor(poissons * 2.0)), 
-        #     requires_grad=optimize_poissons, 
-        # )
-        self.log_poissons = nn.Parameter(
-            torch.log(torch.tensor(poissons)), 
+        self.poissons = nn.Parameter(
+            torch.tensor(poissons), 
             requires_grad=optimize_poissons, 
         )
 
@@ -68,14 +64,14 @@ class NavierCauchy(Solver):
     def youngs(self): 
         return torch.exp(self.log_youngs)
 
-    @property
-    def poissons(self): 
-        return torch.sigmoid(self.log_poissons) 
+    # @property
+    # def poissons(self): 
+    #     return torch.sigmoid(self.poissons) 
 
     def property_parameters(self):
         yield self.log_density
         yield self.log_youngs
-        yield self.logit_poissons
+        yield self.poissons
 
     def compute_loss(
         self,
@@ -88,6 +84,7 @@ class NavierCauchy(Solver):
         use_ic: bool = True,
         use_bc: bool = True,
         use_vel: bool = False,
+        return_traces: bool=False,
     ) -> dict[str, torch.Tensor]:
         """ Calculates the loss for the Navier-Cauchy equation. """
         
@@ -279,13 +276,36 @@ class NavierCauchy(Solver):
             l2_loss = torch.mean((uvw_global - disp_flat).square())
             gt_loss = l1_loss + l2_loss
 
-        return {
+        losses = {
             "pde_loss": pde_loss,
             "ic_loss":  ic_loss,
             "vel_loss": vel_loss,
             "gt_loss":  gt_loss,
             "bc_loss" : bc_loss,
         }
+        traces = {
+            'lmbda': lmbda,
+            'mu': mu,
+            'grad_u_mat': grad_u_mat,
+            'F': F,
+            'J': J,
+            'F_stable': F_stable,
+            'F_inv_T': F_inv_T,
+            'log_J': log_J,
+            'div_sigma_x': div_sigma_x,
+            'div_sigma_y': div_sigma_y,
+            'div_sigma_z': div_sigma_z,
+            'pde_x': pde_x,
+            'du_dt2': du_dt2,
+            'pde_y': pde_y,
+            'dv_dt2': dv_dt2,
+            'pde_z': pde_z,
+            'dw_dt2': dw_dt2,
+        }
+        if return_traces:
+            return losses, traces
+        else:
+            return losses
 
 
 if __name__ == "__main__":

@@ -99,10 +99,12 @@ class MLPBase(nn.Module, ABC):
                 module.is_first = True
                 break
     
-    def initialize_weights(self):
+    def initialize_weights(self, generator=None, init_fn=None):
+        if init_fn is None:
+            init_fn = nn.init.xavier_normal_
         for m in self.modules():
             if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
+                init_fn(m.weight, generator=generator)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
     

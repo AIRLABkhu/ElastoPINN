@@ -15,23 +15,33 @@ from utils.logging import (
     Averager,
     CheckpointWriter,
 )
+from utils.nn import SIREN
+from utils import gc
 
+torch.autograd.set_detect_anomaly(True)
 
 # -------------------------------------
 # Load configuration
 # -------------------------------------
+
+MLP_INIT_DICT = {
+    'xavier_uni': nn.init.xavier_uniform_,
+    'xavier_nor': nn.init.xavier_normal_,
+    'kaiming_uni': nn.init.kaiming_uniform_,
+    'kaiming_nor': nn.init.kaiming_normal_,
+}
 
 parser = ArgumentParser('Navier-Cauchy')
 add = parser.add_argument
 add('--device', '-d', type=int, default=0)
 add('--object', '-o', type=str.lower, default='bird', choices=PACNeRFDataset.INSTANCES)
 add('--mlp', '-mlp', type=str.lower, default='mlp', choices=mlp_dict.keys())
+add('--mlp-init', type=str.lower, default='xavier_nor', choices=list(MLP_INIT_DICT.keys()))
 add('--num-frames', '-nf', type=int, default=14)
 add('--batch-size', '-bs', type=int, default=20000)
 add('--learning-rate', '-lr', type=float, default=1.0E-4)
 add('--property-learning-rate', '-plr', type=float, default=1.0E-1)
 add('--epochs', '-e', type=int, default=10_000)
-add('--warmup', '-w', type=int, default=5_000)
 add('--save-every', type=int, default=1_000)
 add('--tag', type=str, default=None)
 add('--overwrite', action='store_true', default=False)
@@ -77,30 +87,36 @@ solver = NavierCauchy(
     hid_dim=128,
     depth=8,
     model_type=mlp_dict[args.mlp],
-    activation = nn.ELU,
+    activation = nn.Tanh,
     
     # Environment
     ground_pos = 0,                    # The y-coord of the ground
     up_index   = dataset.up_index,     # The y axis will be the gravity direction
-    gravity    = 9.80665,              # The gravitational acceleration
+    gravity    = 9.8,                  # The gravitational acceleration
 
     # Physical parameters
     density = cfg.ELASTOMER.DENSITY,    # kg m⁻³
     youngs  = cfg.ELASTOMER.YOUNGS,     # Pa
-    poissons= cfg.ELASTOMER.POISSONS,
+    poissons= 0.1,  # cfg.ELASTOMER.POISSONS,
     
     # Physical parameter optimization options
     optimize_density    = False,        # Indicates whether optimize ρ
-    optimize_youngs     = True,         # Indicates whether optimize E
-    optimize_poissons   = False,        # Indicates whether optimize ν
+    optimize_youngs     = False,         # Indicates whether optimize E
+    optimize_poissons   = True,        # Indicates whether optimize ν
 ).to(DEVICE)
+
+generator = torch.Generator(device=DEVICE)
+generator.manual_seed(1000)
+solver.model.initialize_weights(
+    generator=generator,
+    init_fn=MLP_INIT_DICT[args.mlp_init],
+)
 
 # -------------------------------------
 # Optimizers & Schedulers
 # -------------------------------------
 
 n_epochs = args.epochs
-n_warmups = args.warmup
 
 optimizers = [
     optim.AdamW(
@@ -115,15 +131,10 @@ optimizers = [
 
 schedulers = [
     torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizers[0],
+        optimizer,
         T_max=n_epochs,
         eta_min=0,
-    ), 
-    torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizers[1],
-        T_max=n_epochs - n_warmups,
-        eta_min=0,
-    ), 
+    ) for optimizer in optimizers
 ]
 
 # -------------------------------------
@@ -139,6 +150,7 @@ prop_history.push({
     'youngs': solver.youngs,
     'poissons': solver.poissons,
 }, flush=True)
+tensor_trace = Averager()
 lr_history = Averager()
 ckpt_writer = CheckpointWriter(
     dir_name=f'./output/{object_name}_{args.tag}' if args.tag else f'./output/{object_name}',
@@ -198,18 +210,17 @@ for epoch in range(n_epochs):
             raise NotImplementedError(solver.model.input_shape)
 
         # forward
-        b_warmup_done = epoch >= n_warmups
-        losses = solver.compute_loss(
+        losses, traces = solver.compute_loss(
             xyzt,
             time_dim=num_timesteps,
             point_dim=num_points,
             time=time_value,
             displacement=displacement,
-            use_pde=b_warmup_done,
-            use_ic=False,
-            use_bc=False,
+            use_pde=True,
             use_vel=False,
+            return_traces=True
         )
+        traces: dict[str, torch.Tensor]
         losses: dict[str, torch.Tensor] = {
             'pde_loss': losses['pde_loss'] * loss_weight_pde,
             'gt_loss': losses['gt_loss'] * loss_weight_gt,
@@ -219,27 +230,31 @@ for epoch in range(n_epochs):
         }
         
         # loss backward and gradient steps
+        for val in traces.values():
+            val.retain_grad()
+        
         total_loss = sum(losses.values())
-        total_loss.backward()
+        total_loss.backward(retain_graph=True)
+        
+        tensor_trace.push({f'fwd_{key}': val.data for key, val in traces.items()})
+        tensor_trace.push({f'bwd_{key}': val.grad for key, val in traces.items()})
 
         # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clipping 
-        optimizers[0].step()
-        optimizers[0].zero_grad()
-        if b_warmup_done:
-            optimizers[1].step()
-            optimizers[1].zero_grad()
+        for optimizer in optimizers:
+            optimizer.step()
+            optimizer.zero_grad()
 
         # logging the losses
         loss_history_detailed.push(losses)
+        gc.collect()
 
     # logging the losses 
     epoch_loss_detailed = loss_history_detailed.flush()
     epoch_loss = sum(epoch_loss_detailed.values())
 
-    # scheduler step w.r.t. the total loss
-    schedulers[0].step()
-    if b_warmup_done:
-        schedulers[1].step()
+    # # scheduler step w.r.t. the total loss
+    # for scheduler in schedulers:
+    #     scheduler.step()
 
     # logging the physical parameters and total loss
     loss_history.push({
@@ -252,12 +267,12 @@ for epoch in range(n_epochs):
     }, flush=True)
     lr_history.push({
         'network': optimizers[0].param_groups[0]['lr'],
-        'prop': optimizers[1].param_groups[0]['lr'] if b_warmup_done else 0.0,
+        'prop': optimizers[1].param_groups[0]['lr'],
     }, flush=True)
+    tensor_trace.flush()
     
     # save the checkpoints to the file(s)
     ckpt_writer.write({
-        'args': vars(args),
         'epoch': epoch + 1,
         'model': {
             key: val.clone().detach().cpu()
@@ -272,6 +287,7 @@ for epoch in range(n_epochs):
         'loss_detailed': loss_history_detailed.gather(),
         'lr_list': lr_history.gather(),
         'prop_traj': prop_history.gather(),
+        'tensor_trace': tensor_trace.take(-1),
     }, score=epoch_loss)
 
     print(
