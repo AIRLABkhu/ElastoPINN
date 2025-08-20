@@ -15,7 +15,9 @@ from utils.logging import (
     Averager,
     CheckpointWriter,
 )
+from utils import gc
 
+torch.autograd.set_detect_anomaly(True)
 
 # -------------------------------------
 # Load configuration
@@ -81,17 +83,17 @@ solver = NavierCauchy(
     # Environment
     ground_pos = 0,                    # The y-coord of the ground
     up_index   = dataset.up_index,     # The y axis will be the gravity direction
-    gravity    = 9.80665,              # The gravitational acceleration
+    gravity    = 9.8,                  # The gravitational acceleration
 
     # Physical parameters
     density = cfg.ELASTOMER.DENSITY,    # kg m⁻³
     youngs  = cfg.ELASTOMER.YOUNGS,     # Pa
-    poissons= cfg.ELASTOMER.POISSONS,
+    poissons= 0.1,  # cfg.ELASTOMER.POISSONS,
     
     # Physical parameter optimization options
     optimize_density    = False,        # Indicates whether optimize ρ
-    optimize_youngs     = True,         # Indicates whether optimize E
-    optimize_poissons   = False,        # Indicates whether optimize ν
+    optimize_youngs     = False,         # Indicates whether optimize E
+    optimize_poissons   = True,        # Indicates whether optimize ν
 ).to(DEVICE)
 
 # -------------------------------------
@@ -132,6 +134,7 @@ prop_history.push({
     'youngs': solver.youngs,
     'poissons': solver.poissons,
 }, flush=True)
+tensor_trace = Averager()
 lr_history = Averager()
 ckpt_writer = CheckpointWriter(
     dir_name=f'./output/{object_name}_{args.tag}' if args.tag else f'./output/{object_name}',
@@ -191,7 +194,7 @@ for epoch in range(n_epochs):
             raise NotImplementedError(solver.model.input_shape)
 
         # forward
-        losses = solver.compute_loss(
+        losses, traces = solver.compute_loss(
             xyzt,
             time_dim=num_timesteps,
             point_dim=num_points,
@@ -199,7 +202,9 @@ for epoch in range(n_epochs):
             displacement=displacement,
             use_pde=True,
             use_vel=False,
+            return_traces=True
         )
+        traces: dict[str, torch.Tensor]
         losses: dict[str, torch.Tensor] = {
             'pde_loss': losses['pde_loss'] * loss_weight_pde,
             'gt_loss': losses['gt_loss'] * loss_weight_gt,
@@ -207,10 +212,16 @@ for epoch in range(n_epochs):
             'bc_loss': losses['bc_loss'] * loss_weight_bc,
             'ic_loss': losses['ic_loss'] * loss_weight_ic,
         }
-
+        
         # loss backward and gradient steps
+        for val in traces.values():
+            val.retain_grad()
+        
         total_loss = sum(losses.values())
-        total_loss.backward()
+        total_loss.backward(retain_graph=True)
+        
+        tensor_trace.push({f'fwd_{key}': val.data for key, val in traces.items()})
+        tensor_trace.push({f'bwd_{key}': val.grad for key, val in traces.items()})
 
         # torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # clipping 
         for optimizer in optimizers:
@@ -219,6 +230,7 @@ for epoch in range(n_epochs):
 
         # logging the losses
         loss_history_detailed.push(losses)
+        gc.collect()
 
     # logging the losses 
     epoch_loss_detailed = loss_history_detailed.flush()
@@ -241,6 +253,7 @@ for epoch in range(n_epochs):
         'network': optimizers[0].param_groups[0]['lr'],
         'prop': optimizers[1].param_groups[0]['lr'],
     }, flush=True)
+    tensor_trace.flush()
     
     # save the checkpoints to the file(s)
     ckpt_writer.write({
@@ -258,6 +271,7 @@ for epoch in range(n_epochs):
         'loss_detailed': loss_history_detailed.gather(),
         'lr_list': lr_history.gather(),
         'prop_traj': prop_history.gather(),
+        'tensor_trace': tensor_trace.take(-1),
     }, score=epoch_loss)
 
     print(
