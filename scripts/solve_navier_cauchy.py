@@ -11,6 +11,7 @@ from data.pac_nerf import PACNeRFDataset
 
 from models.mlp import mlp_dict, LoRAMLP
 from models.navier_cauchy_neo_hookean import NavierCauchy
+# from models.navier_cauchy_neo_hookean_piola import NavierCauchy
 from utils.nn import SIREN
 from utils.logging import (
     Averager,
@@ -83,12 +84,12 @@ solver = NavierCauchy(
     hid_dim=128,
     depth=8,
     model_type=mlp_dict[args.mlp],
-    activation=SIREN,
+    activation=nn.Tanh,
     
     # Environment
-    ground_pos = 0,                    # The y-coord of the ground
+    ground_pos = 0.0,          
     up_index   = dataset.up_index,     # The y axis will be the gravity direction
-    gravity    = 9.80665,              # The gravitational acceleration
+    gravity    = 9.8,              # pac-nerf use 9.8 not 9.800xxx 
 
     # Physical parameters
     density = cfg.ELASTOMER.DENSITY,    # kg m⁻³
@@ -146,6 +147,8 @@ prop_history.push({
     'poissons': solver.poissons,
 }, flush=True)
 lr_history = Averager()
+lame_history = Averager()
+
 ckpt_writer = CheckpointWriter(
     dir_name=f'./output/{object_name}_{args.tag}' if args.tag else f'./output/{object_name}',
     save_first=False,
@@ -221,8 +224,8 @@ for epoch in range(n_epochs):
             time=time_value,
             displacement=displacement,
             use_pde=b_warmup_done,
-            use_ic=False,
-            use_bc=False,
+            use_ic=True,
+            use_bc=True,
             use_vel=False,
         )
         losses: dict[str, torch.Tensor] = {
@@ -233,7 +236,9 @@ for epoch in range(n_epochs):
         }
         
         # loss backward and gradient steps
-        total_loss = sum(losses.values())
+        # total_loss = sum(losses.values())
+        # total_loss.backward()
+        total_loss = sum(loss_val for name, loss_val in losses.items() if name != 'cp_loss')
         total_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(solver.parameters(), 1.0) # clipping 
@@ -243,6 +248,7 @@ for epoch in range(n_epochs):
             optimizers[1].step()
             optimizers[1].zero_grad()
 
+  
         # logging the losses
         loss_history_detailed.push(losses)
 
@@ -251,10 +257,19 @@ for epoch in range(n_epochs):
     epoch_loss = sum(epoch_loss_detailed.values())
 
     # scheduler step (w.r.t. the total loss if need)
-    if not args.const_lr:
-        schedulers[0].step()
-        if b_warmup_done:
-            schedulers[1].step()
+    # if not args.const_lr:
+    #     schedulers[0].step()
+    #     if b_warmup_done:
+    #         schedulers[1].step()
+    E_ = solver.youngs.data
+    mu_ = solver.poissons.data
+    lmbda_ = (E_ * mu_) / ((1 + mu_) * (1 - 2 * mu_))
+    mu_ = E_ / (2 * (1 + mu_))
+
+    lame_history.push({
+        'lambda': lmbda_,
+        'mu': mu_,
+    }, flush=True)  
 
     # logging the physical parameters and total loss
     loss_history.push({
@@ -287,6 +302,7 @@ for epoch in range(n_epochs):
         'loss_detailed': loss_history_detailed.gather(),
         'lr_list': lr_history.gather(),
         'prop_traj': prop_history.gather(),
+        'lame_traj': lame_history.gather(),
     }, score=epoch_loss)
 
     print(

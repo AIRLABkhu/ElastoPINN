@@ -1,10 +1,10 @@
 ELASTOMER:
   DENSITY: 1.0E+3
   YOUNGS: 3.0E+5
-  POISSONS: 0.3
+  POISSONS: 0.1
   LOSS:
-    PDE: 1.0E-8
-    GT: 1.0E+3
-    VEL: 1.0E+3
-    BC: 1.0E-8
-    IC: 0.0
+    PDE: 1.0E-22
+    GT: 1.0E+8
+    VEL: 1.0E+0
+    BC: 1.0E+3
+    IC: 1.0E+3
